@@ -1,403 +1,355 @@
-# redowl
+\# redowl
 
-使用Redis List 和Redis PubSub模拟一个SQS功能
+用 Redis 的 List / Hash / ZSet 模拟一套「接近 SQS 语义」的队列：支持 Ack、可见性超时、DLQ（死信队列）、DLQ redrive，以及可选的 PubSub 事件（用于触发/动态发现队列）。
 
-1. 支持消息确认
-2. 支持死信队列
-3. 支持触发器
-4. 支持redis Cluster Client 和Redis Client，使用redis.cmdable 对象传入作为构造函数参数，使用redisv9库
-5. 支持消息可见性超时
+本仓库 Go module：`github.com/aura-studio/redowl`（Go 1.21）。Redis 客户端使用 `github.com/redis/go-redis/v9`。
 
-## Redis Key 结构
+---
 
-默认 `Prefix` 为 `redowl`，队列名为 `name` 时：
+## 特性概览
 
-- Ready 队列（List）：`{Prefix}:{name}:ready`
-	- 存储：消息 ID（string）
-	- 方向：生产 `RPUSH`，消费 `LPOP/BLPOP`
-- DLQ 队列（List）：`{Prefix}:{name}:dlq`
-	- 存储：消息 ID（string）
-	- 方向：进入 DLQ 时 `RPUSH`；DLQ 消费 `LPOP/BLPOP`；redrive 使用 `RPOPLPUSH` 移回 ready
-- 消息内容（Hash）：`{Prefix}:{name}:msg:{id}`
-	- 字段：
-		- `body`：base64 编码后的消息体
-		- `attrs`：JSON（map[string]string）
-		- `rc`：接收次数（int）
-		- `created_at_ms`：创建时间（Unix 毫秒）
-- Receipt 映射（Hash）：`{Prefix}:{name}:receipt`
-	- 映射：`receiptHandle -> messageID`
-	- 用途：`Ack(receiptHandle)` 时定位消息 ID
-- In-flight 可见性（ZSet）：`{Prefix}:{name}:inflight`
-	- member：`receiptHandle`
-	- score：`visibleAtUnixMs`（可见性超时到期时间的 Unix 毫秒）
-	- 用途：`RequeueExpiredOnce` 扫描超时 receipt 并重新投递
-- 事件 Channel（PubSub）：`{Prefix}:{name}:events`
-	- payload：JSON `redowl.Event`
-	- 事件类型：`sent / received / requeued / to_dlq / dlq_received / dlq_redriven / acked`
-	- 说明：除了 per-queue channel 外，redowl 还会同时向 namespace channel 发布相同事件，便于消费者“先订阅再动态发现队列”
-- 事件 Channel（PubSub, namespace）：`{Prefix}:events`
-	- payload：JSON `redowl.Event`（包含 `Queue` 字段）
-	- 用途：消费者无需预先知道队列名/数量，通过订阅该 channel 动态发现 `Queue` 并启动对应消费逻辑
+- SQS-like：发送、接收、Ack（基于 ReceiptHandle）。
+- 可见性超时（Visibility Timeout）：未 Ack 的消息到期可再次投递。
+- DLQ：超过最大投递次数（ReceiveCount）自动进入死信队列。
+- DLQ redrive：把 DLQ 消息批量移回 ready。
+- 事件（PubSub，可选）：发送/接收/重投递/进入 DLQ/从 DLQ 接收/从 DLQ redrive/Ack。
+- WorkerPool：用少量 worker 消费大量动态队列（通过订阅 `{prefix}:events` 发现队列）。
+- 兼容 Redis 单机与 Cluster：Queue 构造使用 `redis.Cmdable`；WorkerPool 使用 `redis.UniversalClient`。
 
-## 最小用例（含事件订阅）
+---
 
-下面示例包含：创建队列、订阅事件、发送、接收、Ack。
+## 安装
+
+```bash
+go get github.com/aura-studio/redowl
+```
+
+---
+
+## 核心概念
+
+### Message
+
+`Message` 是一次“投递”的载体：
+
+- `ID`：消息 ID。
+- `Body`：消息体（`[]byte`）。
+- `Attributes`：属性（`map[string]string`）。
+- `ReceiptHandle`：Ack 必需的句柄（一次投递对应一个 receipt）。
+- `ReceiveCount`：累计投递次数（每次 receive 会自增）。
+- `VisibleAt`：本次投递的可见性到期时间。
+- `CreatedAt`：创建时间。
+
+### Queue
+
+`Queue` 提供：
+
+- `Send(ctx, body, attrs)`
+- `Receive(ctx)` / `ReceiveWithWait(ctx, wait)`
+- `Ack(ctx, receiptHandle)`
+- `ChangeVisibility(ctx, receiptHandle, d)`
+- `RequeueExpiredOnce(ctx, batch)`
+- `ReceiveDLQ(ctx)` / `ReceiveDLQWithWait(ctx, wait)`
+- `RedriveDLQ(ctx, n)`
+- `Subscribe(ctx, handler)`（需要配置 triggers）
+- `StartReaper()` / `StopReaper()`（后台回收器，需配置 `WithReaperInterval`）
+
+---
+
+## 快速开始：发送 / 接收 / Ack
 
 ```go
 package main
 
 import (
-	"context"
-	"fmt"
-	"time"
+    "context"
+    "fmt"
+    "time"
 
-	"github.com/aura-studio/boost/redowl"
-	"github.com/redis/go-redis/v9"
+    "github.com/aura-studio/redowl"
+    "github.com/redis/go-redis/v9"
 )
 
 func main() {
-	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+    ctx := context.Background()
+    rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
 
-	q, _ := redowl.New(
-		rdb,
-		"orders",
-		redowl.WithPrefix("redowl"),
-		redowl.WithVisibilityTimeout(5*time.Second),
-		redowl.WithMaxReceiveCount(3),
-	)
+    q, err := redowl.New(
+        rdb,
+        "orders",
+        redowl.WithVisibilityTimeout(30*time.Second),
+        redowl.WithMaxReceiveCount(3),
+    )
+    if err != nil {
+        panic(err)
+    }
 
-	fmt.Println("ready:", "redowl:orders:ready")
-	fmt.Println("dlq:", "redowl:orders:dlq")
-	fmt.Println("events:", "redowl:orders:events")
+    _, _ = q.Send(ctx, []byte("hello"), map[string]string{"trace_id": "t-1"})
 
-	unsub, _ := q.Subscribe(ctx, func(e redowl.Event) {
-		fmt.Println("event:", e.Type, e.MessageID)
-	})
-	defer func() { _ = unsub() }()
+    msg, err := q.ReceiveWithWait(ctx, 5*time.Second)
+    if err != nil {
+        panic(err)
+    }
+    if msg == nil {
+        return
+    }
 
-	id, _ := q.Send(ctx, []byte("hello"), map[string]string{"trace_id": "t-1"})
-	_ = id
-
-	msg, _ := q.Receive(ctx)
-	if msg == nil {
-		return
-	}
-	fmt.Println("recv:", msg.ID, string(msg.Body), msg.ReceiveCount)
-
-	_ = q.Ack(ctx, msg.ReceiptHandle)
+    fmt.Println("recv:", msg.ID, string(msg.Body), msg.Attributes["trace_id"], msg.ReceiveCount)
+    _ = q.Ack(ctx, msg.ReceiptHandle)
 }
 ```
 
-## 跨进程示例（生产者 / 消费者）
+---
 
-下面演示“生产者”和“消费者”分别在两个独立进程中运行的典型用法：
+## Queue Options
 
-### producer.go
+构造队列：
 
 ```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"time"
-
-	"github.com/aura-studio/boost/redowl"
-	"github.com/redis/go-redis/v9"
+q, err := redowl.New(client, "name",
+    redowl.WithPrefix("myapp"),
+    redowl.WithVisibilityTimeout(10*time.Second),
+    redowl.WithMaxReceiveCount(5),
+    redowl.WithReaperInterval(2*time.Second),
+    redowl.WithTriggerClient(client),
 )
-
-func main() {
-	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
-
-	q, _ := redowl.New(rdb, "orders", redowl.WithVisibilityTimeout(30*time.Second))
-
-	for i := 0; i < 10; i++ {
-		_, _ = q.Send(ctx, []byte("hello"), map[string]string{"i": fmt.Sprint(i)})
-	}
-}
 ```
 
-### consumer.go
+### WithPrefix(prefix)
+
+- Redis key 的前缀，默认 `redowl`。
+
+### WithVisibilityTimeout(d)
+
+- 可见性超时，默认 `30s`。
+- 每次 `Receive/ReceiveWithWait` 会生成新的 `ReceiptHandle`，并写入 inflight ZSet 的到期时间。
+
+### WithMaxReceiveCount(n)
+
+- 最大投递次数；默认 `0` 表示关闭 DLQ 行为。
+- 当 `ReceiveCount` 自增后满足 `rc > n`，该消息会被移动到 DLQ，并且本次 `Receive*` 返回 `(nil, nil)`（即不会把它作为正常消息交给业务）。
+
+### WithReaperInterval(d)
+
+- 开启后台回收器：定期调用 `RequeueExpiredOnce(ctx, 500)`，把过期的 inflight 重新放回 ready。
+- `d <= 0` 时不启动后台回收器（仍可手动调用 `RequeueExpiredOnce`）。
+
+### WithTriggerClient(c)
+
+- 启用 PubSub 事件：`Send/Receive/RequeueExpiredOnce/DLQ/Redrive/Ack` 等会 publish 事件。
+- 若你没有显式配置该 option，但传入的 `cmd` 本身是 `redis.UniversalClient`（例如 `*redis.Client` / `*redis.ClusterClient`），会自动复用它作为触发器客户端。
+
+---
+
+## 事件（PubSub Trigger）
+
+事件结构：
 
 ```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"time"
-
-	"github.com/aura-studio/boost/redowl"
-	"github.com/redis/go-redis/v9"
-)
-
-func main() {
-	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
-
-	q, _ := redowl.New(rdb, "orders", redowl.WithVisibilityTimeout(30*time.Second))
-
-	for {
-		msg, err := q.ReceiveWithWait(ctx, 5*time.Second)
-		if err != nil {
-			panic(err)
-		}
-		if msg == nil {
-			continue
-		}
-
-		fmt.Println("got:", msg.ID, string(msg.Body), msg.ReceiveCount)
-
-		// 业务处理成功后 Ack
-		_ = q.Ack(ctx, msg.ReceiptHandle)
-	}
+type Event struct {
+    Type      redowl.EventType
+    Queue     string
+    MessageID string
+    AtUnixMs  int64
+    Extra     map[string]string
 }
 ```
 
-### 多队列并发消费示例（Game*）：队列内顺序、队列间并发、每条消息独立 goroutine
+事件类型：
 
-下面演示：
+- `sent`
+- `received`
+- `requeued`
+- `to_dlq`
+- `dlq_received`
+- `dlq_redriven`
+- `acked`
 
-- A 进程：分别向多个队列（`Game1..GameN`）按序生产
-- B 进程：同时监听所有 `Game*` 队列
-	- 每个队列内严格顺序消费（上一条处理完成后再取下一条）
-	- 不同队列之间并发消费
-	- 每条消息处理都在独立 goroutine 中执行
+发布通道：
 
-#### producer_games.go
+- per-queue：`{prefix}:{queue}:events`
+- namespace：`{prefix}:events`
 
-```go
-package main
+说明：redowl 会把同一个事件同时 publish 到上述两个通道；这样消费端可以只订阅 namespace 通道就能“动态发现队列”。
 
-import (
-	"context"
-	"fmt"
-	"time"
-
-	"github.com/aura-studio/boost/redowl"
-	"github.com/redis/go-redis/v9"
-)
-
-func main() {
-	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
-
-	const (
-		gameCount   = 14
-		perGameMsgs = 5
-	)
-
-	for i := 0; i < gameCount; i++ {
-		qName := fmt.Sprintf("Game%d", i+1)
-		q, _ := redowl.New(rdb, qName, redowl.WithVisibilityTimeout(30*time.Second))
-
-		prefix := byte('A' + i)
-		for j := 1; j <= perGameMsgs; j++ {
-			payload := fmt.Sprintf("%c%d", prefix, j)
-			_, _ = q.Send(ctx, []byte(payload), map[string]string{"game": fmt.Sprint(i + 1)})
-		}
-	}
-}
-```
-
-#### consumer_games.go
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"sync"
-	"time"
-
-	"github.com/aura-studio/boost/redowl"
-	"github.com/redis/go-redis/v9"
-)
-
-func main() {
-	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
-
-	const (
-		gameCount   = 14
-		perGameMsgs = 5
-	)
-
-	// 每个队列一个 worker：保证队列内顺序；不同 worker 之间天然并发。
-	var wg sync.WaitGroup
-	for i := 0; i < gameCount; i++ {
-		qName := fmt.Sprintf("Game%d", i+1)
-		q, _ := redowl.New(rdb, qName, redowl.WithVisibilityTimeout(30*time.Second))
-
-		wg.Add(1)
-		go func(q *redowl.Queue) {
-			defer wg.Done()
-			for k := 0; k < perGameMsgs; k++ {
-				msg, err := q.ReceiveWithWait(ctx, 5*time.Second)
-				if err != nil {
-					panic(err)
-				}
-				if msg == nil {
-					k--
-					continue
-				}
-
-				done := make(chan struct{})
-				go func(m *redowl.Message) {
-					// 业务处理逻辑...
-					time.Sleep(30 * time.Millisecond)
-					_ = q.Ack(ctx, m.ReceiptHandle)
-					close(done)
-				}(msg)
-
-				<-done // 等待本队列的本条消息处理完成，再取下一条
-			}
-		}(q)
-	}
-
-	wg.Wait()
-}
-```
-
-### 关于“消费者崩溃”和可见性超时
-
-- 如果消费者在处理过程中崩溃/未 Ack，消息会在 `VisibilityTimeout` 到期后变为可再次投递。
-- 你可以：
-  - 让消费者周期性调用 `RequeueExpiredOnce`（或开启 `WithReaperInterval`），以便及时回收超时 in-flight 消息；
-  - 或者依赖下一次 `Receive/ReceiveWithWait` 的 best-effort 回收（内部会尝试回收一批超时消息）。
-
-## 快速开始
-
-### 基本用法：发送 / 接收 / Ack
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"time"
-
-	"github.com/aura-studio/boost/redowl"
-	"github.com/redis/go-redis/v9"
-)
-
-func main() {
-	ctx := context.Background()
-
-	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
-	q, _ := redowl.New(rdb, "orders", redowl.WithVisibilityTimeout(30*time.Second))
-
-	_, _ = q.Send(ctx, []byte("hello"), map[string]string{"trace_id": "t-1"})
-
-	msg, _ := q.Receive(ctx)
-	if msg == nil {
-		return
-	}
-
-	fmt.Println(string(msg.Body), msg.Attributes["trace_id"], msg.ReceiveCount)
-
-	// 成功处理后确认删除
-	_ = q.Ack(ctx, msg.ReceiptHandle)
-}
-```
-
-### 可见性超时
-
-- `Receive/ReceiveWithWait` 会把消息标记为 in-flight，并在 `VisibilityTimeout` 到期后允许重新投递。
-- 你可以手动调用 `RequeueExpiredOnce` 回收超时消息；或配置 `WithReaperInterval` 开启后台回收器。
-
-### 触发器（PubSub）
-
-- 如果你传入的 `redis.Cmdable` 本身是 `*redis.Client/*redis.ClusterClient`，会自动启用同一个客户端作为触发器的 PubSub 客户端。
-- 也可以显式传入 `WithTriggerClient(client)`。
+订阅 per-queue 事件：
 
 ```go
 unsub, err := q.Subscribe(ctx, func(e redowl.Event) {
-	// e.Type: sent/received/requeued/to_dlq/dlq_received/dlq_redriven/acked
+    // e.Queue / e.Type / e.MessageID ...
 })
+if err != nil {
+    // 可能是 redowl.ErrTriggersNotConfigured
+    panic(err)
+}
 defer func() { _ = unsub() }()
 ```
 
-### Redis Cluster Client 用法
+---
 
-`redowl.New` 的第一个参数是 `redis.Cmdable`，因此可以直接传入 `*redis.ClusterClient`：
+## 可见性超时与回收
 
-```go
-cluster := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"127.0.0.1:7000", "127.0.0.1:7001", "127.0.0.1:7002"}})
-q, _ := redowl.New(cluster, "orders")
-```
+### 重要行为
 
-说明：本仓库的单元测试使用 `miniredis`，它不支持完整 Redis Cluster 协议；因此 Cluster 场景的测试以 build tag 的“外部集成测试”形式提供（需要真实 Redis Cluster）。
+- 如果消费者在处理过程中崩溃或忘记 Ack，消息不会丢失：它会在 `VisibilityTimeout` 到期后变为可再次投递。
+- `ReceiveWithWait` 内部会做一次 best-effort 的回收：每次调用都会先尝试 `RequeueExpiredOnce(ctx, 100)`。
 
-#### Cluster case（对应 multi-Game 并发/顺序用例）的集成测试
-
-仓库中提供了一个 ClusterClient 版本的集成测试（需要真实 Redis Cluster）：
-
-- 测试文件：`redowl/integration_test.go`
-- build tag：`rediscluster`
-- 环境变量：`REDIS_CLUSTER_ADDRS`（逗号分隔的节点地址）
-
-该用例的消费者侧会先订阅 namespace channel：`{Prefix}:events`，从事件里的 `Queue` 字段动态发现队列并启动 per-queue worker（保证队列内顺序、队列间并发）。
-
-运行方式示例（Windows PowerShell）：
-
-```powershell
-$env:REDIS_CLUSTER_ADDRS = "127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002"
-go test -tags=rediscluster ./redowl -run ClusterClient
-```
-
-运行方式示例（bash）：
-
-```bash
-REDIS_CLUSTER_ADDRS=127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 \
-  go test -tags=rediscluster ./redowl -run ClusterClient
-```
-
-该测试复用了与本文档“多队列并发消费示例（Game*）”一致的语义验证：
-
-- A 进程（producer）向 `Game1..Game14` 分别按序生产 `A1..A5` 到 `N1..N5`
-- B 进程（consumer）同时监听所有 `Game*` 队列
-	- 每个队列内严格顺序消费（上一条处理完成后再取下一条）
-	- 不同队列之间并发消费
-	- 每条消息处理在独立 goroutine 中执行
-
-为避免在共享 Cluster 环境中相互影响，测试会为每次运行生成唯一的 `Prefix` 来隔离 keys。
-
-### 死信队列（DLQ）
-
-- 通过 `WithMaxReceiveCount(n)` 开启：当消息被投递次数 `ReceiveCount` 超过 n，会进入 DLQ。
-- DLQ 消费：`ReceiveDLQ/ReceiveDLQWithWait`。
-- DLQ 返回的消息同样带 `ReceiptHandle`，可直接用 `Ack` 删除消息。
+### 手动回收：RequeueExpiredOnce
 
 ```go
-dlqMsg, _ := q.ReceiveDLQ(ctx)
+requeued, err := q.RequeueExpiredOnce(ctx, 100)
+_ = requeued
+_ = err
+```
+
+### 后台回收器：WithReaperInterval
+
+```go
+q, _ := redowl.New(client, "orders",
+    redowl.WithReaperInterval(2*time.Second),
+)
+defer q.StopReaper() // 建议在退出时停止
+```
+
+---
+
+## DLQ（死信队列）
+
+启用：
+
+```go
+q, _ := redowl.New(client, "orders", redowl.WithMaxReceiveCount(3))
+```
+
+### ReceiveDLQ / ReceiveDLQWithWait
+
+- DLQ 接收会把消息 ID 从 DLQ list 弹出（类似消费 ready）。
+- DLQ 也会生成 `ReceiptHandle`，用于调用 `Ack` 删除消息。
+- DLQ 接收不应用可见性超时；一旦从 DLQ list 取出，就不会自动回到 DLQ。
+
+```go
+dlqMsg, err := q.ReceiveDLQWithWait(ctx, 5*time.Second)
+if err != nil {
+    panic(err)
+}
 if dlqMsg != nil {
-	// 记录/报警/手动处理...
-	_ = q.Ack(ctx, dlqMsg.ReceiptHandle)
+    // 记录/报警/人工处理...
+    _ = q.Ack(ctx, dlqMsg.ReceiptHandle)
 }
 ```
 
-### DLQ Redrive（重新投递）
+### RedriveDLQ
 
-将 DLQ 中的消息重新放回 ready：
+把 DLQ 中最多 n 条消息移回 ready：
 
 ```go
-// 把最多 100 条 DLQ 消息放回 ready
 moved, err := q.RedriveDLQ(ctx, 100)
 _ = moved
 _ = err
 ```
 
+实现备注：redrive 仅移动“消息 ID”，消息体仍在 msg hash 中；并会把 ReceiveCount 复位为 0，以便重新投递。
 
-## Worker 池：高效处理大量队列
+---
 
-当队列数量无限扩展时，为每个队列创建一个 worker 会造成资源浪费。Worker 池可以用**少量 worker 处理大量队列**。
+## WorkerPool：用少量 worker 处理大量队列
 
-### 问题场景
+当队列数非常大且动态变化时，「每队列一个 goroutine」会浪费资源。WorkerPool 通过订阅 `{prefix}:events`，在收到 `EventSent` 时把队列加入调度，并用有限数量的 worker 串行处理单个队列、并发处理多个队列。
+
+### 创建与启动
+
+```go
+pool := redowl.NewWorkerPool(
+    client,          // redis.UniversalClient
+    "myapp",         // prefix（同时也是订阅的 namespace 事件 channel）
+    func(ctx context.Context, queueName string, msg *redowl.Message) error {
+        // 业务处理...
+        return nil // 返回 nil 将自动 Ack；返回 error 不 Ack（等待可见性超时后重投）
+    },
+    redowl.WithMaxWorkers(10),
+    redowl.WithMinWorkers(0),
+    redowl.WithQueueIdleTimeout(5*time.Minute),
+    redowl.WithWorkerIdleTimeout(30*time.Second),
+    redowl.WithPollInterval(500*time.Millisecond),
+)
+
+if err := pool.Start(ctx); err != nil {
+    panic(err)
+}
+defer pool.Stop()
+```
+
+### PoolOption 说明
+
+- `WithMaxWorkers(n)`：最大 worker 数，默认 10。
+- `WithMinWorkers(n)`：最小常驻 worker 数，默认 0。
+- `WithQueueIdleTimeout(d)`：队列“无消息”持续多久后，worker 停止处理该队列；并且该队列的统计元数据在后续清理周期中会被删除，默认 5 分钟。
+- `WithWorkerIdleTimeout(d)`：worker 空闲多久后允许退出（但不会低于 MinWorkers），默认 30 秒。
+- `WithPollInterval(d)`：单个队列上的 `ReceiveWithWait` 等待/轮询间隔，默认 500ms。
+
+### 顺序与并发语义
+
+- 同一队列：单个 worker 在 `processQueue` 中循环 receive + handler +（成功则 ack），因此队列内是串行处理。
+- 不同队列：多个 worker 可并发处理不同队列。
+
+### 统计
+
+```go
+stats := pool.Stats()
+// map[queueName]processedMessageCount
+```
+
+---
+
+## Redis Key 结构（实现细节）
+
+默认 `prefix=redowl`、队列名为 `name`：
+
+- Ready（List）：`{prefix}:{name}:ready`（RPUSH 入队，LPOP/BLPOP 出队）
+- DLQ（List）：`{prefix}:{name}:dlq`
+- Message（Hash）：`{prefix}:{name}:msg:{id}`
+  - `body`：base64 编码
+  - `attrs`：JSON 字符串（map）
+  - `rc`：接收次数
+  - `created_at_ms`：Unix 毫秒
+- ReceiptMap（Hash）：`{prefix}:{name}:receipt`（receiptHandle -> messageID）
+- Inflight（ZSet）：`{prefix}:{name}:inflight`（member=receiptHandle，score=visibleAtUnixMs）
+- Events（PubSub）：`{prefix}:{name}:events` 与 `{prefix}:events`
+
+提示：这些 key 命名来自当前实现（见 `queue.go`），若未来实现调整，文档可能需要同步更新。
+
+---
+
+## Redis Cluster / 集成测试
+
+- Queue 侧：`redowl.New` 接收 `redis.Cmdable`，所以可直接传 `*redis.ClusterClient`。
+- WorkerPool 侧：`redowl.NewWorkerPool` 需要 `redis.UniversalClient`，`*redis.ClusterClient` 满足。
+
+本仓库的单测使用 `miniredis`（不模拟完整 cluster）；cluster 场景的用例放在测试里，通过环境变量开关运行：
+
+- `REDIS_CLUSTER_ADDRS`：逗号分隔的 cluster 节点地址。
+
+示例（PowerShell）：
+
+```powershell
+$env:REDIS_CLUSTER_ADDRS = "127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002"
+go test ./... -run ClusterClient
+```
+
+示例（bash）：
+
+```bash
+REDIS_CLUSTER_ADDRS=127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 \
+  go test ./... -run ClusterClient
+```
+
+---
+
+## 常见坑与建议
+
+- `Ack` 依赖 `ReceiptHandle`；重复 Ack 或过期 receipt 会返回 `redowl.ErrInvalidReceiptHandle`。
+- `ReceiveWithWait` 的 wait >= 1s 时会用 Redis `BLPOP`（秒级精度）；小于 1 秒则用轮询 + sleep。
+- 生产环境建议开启 `WithReaperInterval` 或由外部定时任务调用 `RequeueExpiredOnce`，以便更及时回收超时消息。
 
 ```go
 // ❌ 不推荐：1000 个队列 = 1000 个 goroutine
@@ -558,7 +510,7 @@ redowl.WithPollInterval(d time.Duration) // 轮询间隔（默认 500ms）
 时间线：
 t0: Queue1 有消息 → Worker1 处理 Queue1
 t1: Queue1 空闲 (1/3)
-t2: Queue1 空闲 (2/3)  
+t2: Queue1 空闲 (2/3)
 t3: Queue1 空闲 (3/3) → Worker1 释放，可处理其他队列
 t4: Queue2 有消息 → Worker1 处理 Queue2
 ```
