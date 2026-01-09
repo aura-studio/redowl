@@ -43,8 +43,7 @@ type queueState struct {
 
 type PoolOption func(*WorkerPool)
 
-func WithWorkerCount(n int) PoolOption {
-	// Backward-compatible: treat as max worker count.
+func WithMaxWorkers(n int) PoolOption {
 	return func(p *WorkerPool) { p.maxWorkers = n }
 }
 
@@ -52,8 +51,7 @@ func WithMinWorkers(n int) PoolOption {
 	return func(p *WorkerPool) { p.minWorkers = n }
 }
 
-func WithIdleTimeout(d time.Duration) PoolOption {
-	// Backward-compatible: treat as per-queue idle timeout.
+func WithQueueIdleTimeout(d time.Duration) PoolOption {
 	return func(p *WorkerPool) { p.queueIdle = d }
 }
 
@@ -378,4 +376,11 @@ func (p *WorkerPool) Stats() map[string]int64 {
 		stats[name] = qs.msgCount
 	}
 	return stats
+}
+
+// LiveWorkers returns the number of currently running worker goroutines.
+func (p *WorkerPool) LiveWorkers() int {
+	p.workersMu.Lock()
+	defer p.workersMu.Unlock()
+	return p.workersLive
 }

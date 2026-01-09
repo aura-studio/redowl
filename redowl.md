@@ -423,8 +423,8 @@ pool := redowl.NewWorkerPool(
         fmt.Printf("[%s] %s\n", queueName, string(msg.Body))
         return nil // 返回 nil 自动 Ack
     },
-    redowl.WithWorkerCount(10),           // 只用 10 个 worker
-    redowl.WithIdleTimeout(5*time.Minute), // 5 分钟无消息自动清理队列
+	redowl.WithMaxWorkers(10),             // 最多 10 个 worker
+	redowl.WithQueueIdleTimeout(5*time.Minute), // 5 分钟无消息自动清理队列
     redowl.WithPollInterval(500*time.Millisecond),
 )
 
@@ -499,8 +499,8 @@ func main() {
             time.Sleep(10 * time.Millisecond) // 模拟处理
             return nil // 返回 nil 自动 Ack，返回 error 不 Ack
         },
-        redowl.WithWorkerCount(10),
-        redowl.WithIdleTimeout(5*time.Minute),
+		redowl.WithMaxWorkers(10),
+		redowl.WithQueueIdleTimeout(5*time.Minute),
     )
 
     if err := pool.Start(ctx); err != nil {
@@ -538,8 +538,8 @@ func main() {
 ### 配置选项
 
 ```go
-redowl.WithWorkerCount(n int)           // Worker 数量（默认 10）
-redowl.WithIdleTimeout(d time.Duration) // 空闲队列清理时间（默认 5 分钟）
+redowl.WithMaxWorkers(n int)               // Worker 最大数量（默认 10）
+redowl.WithQueueIdleTimeout(d time.Duration) // 空闲队列清理时间（默认 5 分钟）
 redowl.WithPollInterval(d time.Duration) // 轮询间隔（默认 500ms）
 ```
 
