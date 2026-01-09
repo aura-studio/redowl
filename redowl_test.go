@@ -30,9 +30,6 @@ func msgKey(prefix, name, id string) string {
 }
 func receiptMapKey(prefix, name string) string { return prefix + ":" + name + ":receipt" }
 func inflightKey(prefix, name string) string   { return prefix + ":" + name + ":inflight" }
-func queueEventChannel(prefix, name string) string {
-	return prefix + ":" + name + ":events"
-}
 func namespaceEventChannel(prefix string) string {
 	return prefix + ":events"
 }
@@ -74,6 +71,13 @@ func requireEventually(t *testing.T, timeout time.Duration, interval time.Durati
 // Static / regression tests
 // ---------------------------------
 
+// TestStatic_NoPSubscribeUsage ensures production code never uses go-redis PSUBSCRIBE.
+//
+// Why:
+// - Redis Cluster does not support PSUBSCRIBE.
+// - The implementation intentionally relies on normal SUBSCRIBE with a namespace channel.
+//
+// This is a static scan over non-test .go files to catch accidental regressions.
 func TestStatic_NoPSubscribeUsage(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	require.NoError(t, err)
@@ -103,6 +107,9 @@ func TestStatic_NoPSubscribeUsage(t *testing.T) {
 // Queue: basic -> advanced
 // ---------------------------------
 
+// TestQueue_New_InvalidName verifies queue name validation.
+//
+// The constructor trims spaces; empty or whitespace-only names must fail with ErrInvalidQueueName.
 func TestQueue_New_InvalidName(t *testing.T) {
 	_, c := newTestRedis(t)
 
@@ -113,6 +120,9 @@ func TestQueue_New_InvalidName(t *testing.T) {
 	require.ErrorIs(t, err, redowl.ErrInvalidQueueName)
 }
 
+// TestQueue_New_EmptyPrefixFallsBackToDefault verifies that an empty prefix is normalized.
+//
+// Passing WithPrefix("") should fall back to the default prefix ("redowl") so key layout stays valid.
 func TestQueue_New_EmptyPrefixFallsBackToDefault(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -127,6 +137,13 @@ func TestQueue_New_EmptyPrefixFallsBackToDefault(t *testing.T) {
 	require.EqualValues(t, 1, exists)
 }
 
+// TestQueue_SendReceiveAck_Basic verifies the happy path: Send -> Receive -> Ack.
+//
+// It asserts:
+// - Attributes round-trip.
+// - ReceiptHandle is generated.
+// - ReceiveCount increments.
+// - Ack deletes message data and prevents re-delivery.
 func TestQueue_SendReceiveAck_Basic(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -160,6 +177,10 @@ func TestQueue_SendReceiveAck_Basic(t *testing.T) {
 	require.EqualValues(t, 0, exists)
 }
 
+// TestQueue_Ack_InvalidReceiptHandle verifies Ack input validation and missing receipt behavior.
+//
+// Empty/whitespace receipts should be rejected immediately.
+// Unknown receipts (no mapping in Redis) should return ErrInvalidReceiptHandle.
 func TestQueue_Ack_InvalidReceiptHandle(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -172,6 +193,10 @@ func TestQueue_Ack_InvalidReceiptHandle(t *testing.T) {
 	}
 }
 
+// TestQueue_ChangeVisibility_InvalidReceiptHandle verifies ChangeVisibility input validation.
+//
+// ChangeVisibility is only meaningful for an existing in-flight receipt.
+// Empty/unknown receipts must return ErrInvalidReceiptHandle.
 func TestQueue_ChangeVisibility_InvalidReceiptHandle(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -184,6 +209,10 @@ func TestQueue_ChangeVisibility_InvalidReceiptHandle(t *testing.T) {
 	}
 }
 
+// TestQueue_Receive_SkipsOrphanedReadyID verifies robustness against orphaned IDs in the ready list.
+//
+// A rare race/manual intervention can leave an ID in ready with the msg hash missing.
+// Receive should skip such IDs and return nil (no message), rather than erroring or poisoning the queue.
 func TestQueue_Receive_SkipsOrphanedReadyID(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -198,6 +227,12 @@ func TestQueue_Receive_SkipsOrphanedReadyID(t *testing.T) {
 	require.Nil(t, m)
 }
 
+// TestQueue_RequeueExpiredOnce_CleansOrphanedReceipt verifies robustness of the requeue logic.
+//
+// If inflight contains an expired receipt but the receipt->id mapping points to a missing message,
+// RequeueExpiredOnce should:
+// - clean up the inflight entry and receipt mapping
+// - NOT push the missing message ID back to ready
 func TestQueue_RequeueExpiredOnce_CleansOrphanedReceipt(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -222,6 +257,10 @@ func TestQueue_RequeueExpiredOnce_CleansOrphanedReceipt(t *testing.T) {
 	require.NotContains(t, ids, "missing_msg")
 }
 
+// TestQueue_VisibilityTimeout_RequeueExpiredOnce verifies visibility timeout semantics.
+//
+// If a message is received but not acked before VisibilityTimeout, calling RequeueExpiredOnce
+// should move it back to ready so it can be received again, and ReceiveCount should increment.
 func TestQueue_VisibilityTimeout_RequeueExpiredOnce(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -248,6 +287,10 @@ func TestQueue_VisibilityTimeout_RequeueExpiredOnce(t *testing.T) {
 	require.EqualValues(t, 2, m2.ReceiveCount)
 }
 
+// TestQueue_ChangeVisibility_CanExpireEarly verifies that visibility can be shortened.
+//
+// We receive a message with a long VisibilityTimeout, then ChangeVisibility to a past deadline.
+// RequeueExpiredOnce should immediately make it receivable again.
 func TestQueue_ChangeVisibility_CanExpireEarly(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -274,6 +317,10 @@ func TestQueue_ChangeVisibility_CanExpireEarly(t *testing.T) {
 	require.EqualValues(t, 2, m2.ReceiveCount)
 }
 
+// TestQueue_DLQ_MovesAfterMaxReceiveCount verifies DLQ routing.
+//
+// When MaxReceiveCount is set, a message exceeding that count should be moved to DLQ and not
+// delivered from the normal Receive path.
 func TestQueue_DLQ_MovesAfterMaxReceiveCount(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -310,6 +357,9 @@ func TestQueue_DLQ_MovesAfterMaxReceiveCount(t *testing.T) {
 	require.Contains(t, dlqIDs, id)
 }
 
+// TestQueue_DLQ_ReceiveAndAck_DeletesMessage verifies DLQ consumption and cleanup.
+//
+// DLQ receive produces a ReceiptHandle so the caller can Ack to delete the message data.
 func TestQueue_DLQ_ReceiveAndAck_DeletesMessage(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -344,6 +394,9 @@ func TestQueue_DLQ_ReceiveAndAck_DeletesMessage(t *testing.T) {
 	require.EqualValues(t, 0, exists)
 }
 
+// TestQueue_RedriveDLQ_MovesBackAndResetsReceiveCount verifies DLQ redrive behavior.
+//
+// RedriveDLQ moves message IDs back to ready and resets rc to 0 so the message can be processed again.
 func TestQueue_RedriveDLQ_MovesBackAndResetsReceiveCount(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -376,6 +429,10 @@ func TestQueue_RedriveDLQ_MovesBackAndResetsReceiveCount(t *testing.T) {
 	require.EqualValues(t, 1, m3.ReceiveCount)
 }
 
+// TestQueue_ReceiveWithWait_SubSecondTimeoutReturnsNil verifies the sub-second wait behavior.
+//
+// For waits < 1 second, ReceiveWithWait polls with small sleeps up to the deadline.
+// When no message arrives, it should return (nil, nil) after approximately the given duration.
 func TestQueue_ReceiveWithWait_SubSecondTimeoutReturnsNil(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -389,6 +446,10 @@ func TestQueue_ReceiveWithWait_SubSecondTimeoutReturnsNil(t *testing.T) {
 	require.GreaterOrEqual(t, time.Since(start), 60*time.Millisecond)
 }
 
+// TestQueue_ReceiveWithWait_BLPopReceivesWhenMessageArrives verifies the >=1s wait behavior.
+//
+// For waits >= 1 second, ReceiveWithWait uses Redis BLPOP. When a message arrives during the wait,
+// it should return that message.
 func TestQueue_ReceiveWithWait_BLPopReceivesWhenMessageArrives(t *testing.T) {
 	_, c := newTestRedis(t)
 
@@ -408,6 +469,10 @@ func TestQueue_ReceiveWithWait_BLPopReceivesWhenMessageArrives(t *testing.T) {
 	require.Equal(t, []byte("x"), m.Body)
 }
 
+// TestQueue_Reaper_RequeuesExpiredInFlight verifies the background reaper.
+//
+// WithReaperInterval starts a goroutine that periodically calls RequeueExpiredOnce.
+// Here we receive a message (making it in-flight), don't ack it, and assert it becomes receivable again.
 func TestQueue_Reaper_RequeuesExpiredInFlight(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -431,6 +496,10 @@ func TestQueue_Reaper_RequeuesExpiredInFlight(t *testing.T) {
 	}, "expected message to be requeued and received again")
 }
 
+// TestSubscribe_ReturnsErrWhenTriggersNotConfigured verifies Subscribe requires triggers.
+//
+// We pass a redis.Cmdable that is NOT a redis.UniversalClient (pipeline), which prevents auto trigger
+// configuration, and expect ErrTriggersNotConfigured.
 func TestSubscribe_ReturnsErrWhenTriggersNotConfigured(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -443,6 +512,10 @@ func TestSubscribe_ReturnsErrWhenTriggersNotConfigured(t *testing.T) {
 	require.ErrorIs(t, err, redowl.ErrTriggersNotConfigured)
 }
 
+// TestEvents_PerQueueSubscribe_SeesLifecycleEvents verifies per-queue event subscription.
+//
+// When triggers are enabled, Send/Receive/Ack should publish events; Subscribe should receive them.
+// This test asserts at least {sent, received, acked} are observed.
 func TestEvents_PerQueueSubscribe_SeesLifecycleEvents(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -490,6 +563,13 @@ func TestEvents_PerQueueSubscribe_SeesLifecycleEvents(t *testing.T) {
 	}, "expected sent/received/acked events")
 }
 
+// TestEvents_NamespaceChannel_IncludesQueueName verifies the namespace event channel.
+//
+// redowl publishes each event to both:
+// - per-queue channel: {prefix}:{queue}:events
+// - namespace channel: {prefix}:events
+//
+// The namespace channel must include the Queue field so consumers can dynamically discover queues.
 func TestEvents_NamespaceChannel_IncludesQueueName(t *testing.T) {
 	_, c := newTestRedis(t)
 	ctx := context.Background()
@@ -521,6 +601,12 @@ func TestEvents_NamespaceChannel_IncludesQueueName(t *testing.T) {
 // WorkerPool
 // ---------------------------------
 
+// TestWorkerPool_ProcessesManyQueues_RespectsMaxWorkers_AndPerQueueOrder verifies WorkerPool core behavior.
+//
+// It asserts:
+// - Many queues can be processed with a small worker cap.
+// - LiveWorkers never exceeds MaxWorkers.
+// - Within each queue, message order is preserved (the pool processes one message at a time per queue).
 func TestWorkerPool_ProcessesManyQueues_RespectsMaxWorkers_AndPerQueueOrder(t *testing.T) {
 	_, c := newTestRedis(t)
 
@@ -592,6 +678,11 @@ func TestWorkerPool_ProcessesManyQueues_RespectsMaxWorkers_AndPerQueueOrder(t *t
 	}
 }
 
+// TestWorkerPool_StatsTracksProcessedCounts verifies Stats() accounting.
+//
+// WorkerPool tracks per-queue processed message counts (best-effort; updated after each receive).
+// The QueueIdleTimeout is intentionally small so a small worker set rotates across multiple queues
+// instead of camping on the first few for the default 5 minutes.
 func TestWorkerPool_StatsTracksProcessedCounts(t *testing.T) {
 	_, c := newTestRedis(t)
 
@@ -909,6 +1000,15 @@ func assertOrderedPerGame(t *testing.T, gotByKey map[string][]string, gameCount 
 }
 
 func TestIntegration_Cluster_ProducerAndConsumerSeparated(t *testing.T) {
+	// This is an optional integration test that requires a real Redis Cluster.
+	// It is skipped unless REDIS_CLUSTER_ADDRS is set.
+	//
+	// Scenario:
+	// - Producer sends ordered payloads to Game1..GameN (A1.., B1.., ...).
+	// - Consumer subscribes to the namespace event channel and dynamically starts a per-queue worker.
+	// Assertions:
+	// - Per-queue order is preserved.
+	// - Some cross-queue concurrency occurs.
 	addrs := redisClusterAddrsFromEnv(t)
 	producerClient, consumerClient := newClusterClients(t, addrs)
 
@@ -952,6 +1052,12 @@ func TestIntegration_Cluster_ProducerAndConsumerSeparated(t *testing.T) {
 }
 
 func TestIntegration_Cluster_WorkerPoolManyQueues(t *testing.T) {
+	// This is an optional integration test that requires a real Redis Cluster.
+	// It is skipped unless REDIS_CLUSTER_ADDRS is set.
+	//
+	// Scenario:
+	// - Create many queues and send messages.
+	// - WorkerPool should discover and process all queues using limited workers.
 	addrs := redisClusterAddrsFromEnv(t)
 	producerClient, consumerClient := newClusterClients(t, addrs)
 
